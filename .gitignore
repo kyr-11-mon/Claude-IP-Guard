@@ -1,0 +1,17 @@
+# Local installation output
+config.json
+install.json
+logs/
+*.log
+
+# Local test output
+.test-install/
+.vbs-test/
+TestResults/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
