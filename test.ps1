@@ -34,8 +34,8 @@ try {
 
 $guardProcesses = @()
 try {
-    $guardProcesses = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue | Where-Object {
-        ([string]$_.CommandLine) -like ('*' + $InstallDir + '*') -and ([string]$_.CommandLine) -like '*guard.ps1*'
+    $guardProcesses = @(Get-GuardMonitorProcesses | Where-Object {
+        Test-TextContainsDirectory -Text ([string]$_.ScriptPath) -Directory $InstallDir
     })
 } catch {
     $guardProcesses = @()
@@ -47,7 +47,7 @@ if ($guardProcesses.Count -gt 0) {
     $failures.Add('monitor')
 }
 
-if (Test-TcpPort -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000) {
+if (Test-TcpPort -TargetHost ([string]$config.proxyHost) -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000) {
     Write-Host 'PASS: proxy port is reachable.'
 } else {
     Write-Host 'FAIL: proxy port is not reachable.'

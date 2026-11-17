@@ -25,7 +25,9 @@ The only request the tool makes on its own is:
 https://claude.ai/cdn-cgi/trace
 ```
 
-It is sent **through your configured local proxy** to read the exit IP. The
+It is sent **through your configured local proxy** to read the exit IP. For
+SOCKS5 proxies the check uses `socks5h`, so the proxy resolves the `claude.ai`
+DNS name remotely and the tool does not perform a local DNS lookup for it. The
 launcher and monitor do not contact any other server.
 
 Your proxy provider and Anthropic still see Claude's normal traffic, exactly as

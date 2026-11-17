@@ -16,6 +16,23 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 }
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd('\', '/')
 
+$modulePath = Join-Path $InstallDir 'src\ClaudeIPGuard.psm1'
+if (Test-Path -LiteralPath $modulePath -PathType Leaf) {
+    Import-Module $modulePath -Force
+}
+
+function Test-OwnedText {
+    param([string]$Text, [string]$Directory)
+
+    # Literal comparison with a trailing separator: -like would treat [ ] * ? in
+    # the install path as wildcards and would also match sibling directories.
+    $normalized = $Directory.TrimEnd('\', '/')
+    if (Get-Command -Name Test-TextContainsDirectory -ErrorAction SilentlyContinue) {
+        return (Test-TextContainsDirectory -Text $Text -Directory $normalized)
+    }
+    return ([string]$Text).IndexOf(($normalized + '\'), [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
 $desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Claude (IP Guard).lnk'
 $startMenuDir = Join-Path ([Environment]::GetFolderPath('Programs')) 'Claude IP Guard'
 $startupEntry = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude IP Guard Monitor.vbs'
@@ -32,11 +49,11 @@ function Test-PathOwnedByInstall {
             $shell = New-Object -ComObject WScript.Shell
             $shortcut = $shell.CreateShortcut($Path)
             $text = ([string]$shortcut.TargetPath) + ' ' + ([string]$shortcut.Arguments)
-            return ($text -like ('*' + $Directory + '*'))
+            return (Test-OwnedText -Text $text -Directory $Directory)
         }
 
         $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-        return ([string]$text -like ('*' + $Directory + '*'))
+        return (Test-OwnedText -Text ([string]$text) -Directory $Directory)
     } catch {
         return $false
     }
@@ -45,12 +62,19 @@ function Test-PathOwnedByInstall {
 function Get-InstalledGuardProcesses {
     param([string]$Directory)
 
+    if (Get-Command -Name Get-GuardMonitorProcesses -ErrorAction SilentlyContinue) {
+        return @(Get-GuardMonitorProcesses | Where-Object {
+            Test-OwnedText -Text ([string]$_.ScriptPath) -Directory $Directory
+        })
+    }
+
+    # Fallback for partially removed installations whose module is already gone.
     $result = @()
     try {
         $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue)
         foreach ($process in $processes) {
             $commandLine = [string]$process.CommandLine
-            if ($commandLine -like ('*' + $Directory + '*') -and $commandLine -like '*guard.ps1*') {
+            if (Test-OwnedText -Text $commandLine -Directory $Directory -and $commandLine.IndexOf('guard.ps1', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 $result += $process
             }
         }

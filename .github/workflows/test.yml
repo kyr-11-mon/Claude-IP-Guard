@@ -6,7 +6,12 @@ on:
 
 jobs:
   pester:
+    name: Pester (${{ matrix.shell }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -18,7 +23,7 @@ jobs:
           Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
 
       - name: Run unit tests
-        shell: pwsh
+        shell: ${{ matrix.shell }}
         run: |
           Import-Module Pester -MinimumVersion 5.5.0
           $result = Invoke-Pester -Path ./tests -PassThru -Output Detailed

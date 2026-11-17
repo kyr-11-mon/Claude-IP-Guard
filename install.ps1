@@ -17,7 +17,11 @@ param(
 
     [switch]$DryRun,
 
-    [switch]$Force
+    [switch]$Force,
+
+    # Declared last so existing positional invocations keep binding ExpectedIp
+    # as the third argument.
+    [string]$ProxyHost = '127.0.0.1'
 )
 
 Set-StrictMode -Version Latest
@@ -40,7 +44,7 @@ if ([string]::IsNullOrWhiteSpace($ExpectedIp)) {
 }
 
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd('\', '/')
-$config = New-GuardConfig -ProxyType $ProxyType -ProxyPort $ProxyPort -ExpectedIp $ExpectedIp -ClaudeExe $ClaudeExe
+$config = New-GuardConfig -ProxyType $ProxyType -ProxyPort $ProxyPort -ProxyHost $ProxyHost -ExpectedIp $ExpectedIp -ClaudeExe $ClaudeExe
 $plan = New-InstallPlan -InstallDir $InstallDir -SourceRoot $PSScriptRoot -ClaudeExe $ClaudeExe -NoShortcuts:$NoShortcuts
 
 if ($DryRun) {
@@ -64,8 +68,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'src\launch.ps1') -Pat
 }
 
 if (-not $SkipProxyCheck) {
-    if (-not (Test-TcpPort -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000)) {
-        throw ('The local proxy port {0} is not accepting connections.' -f $config.proxyPort)
+    if (-not (Test-TcpPort -TargetHost ([string]$config.proxyHost) -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000)) {
+        throw ('The local proxy port {0} on {1} is not accepting connections.' -f $config.proxyPort, $config.proxyHost)
     }
     $actualIp = Get-CurrentExitIp -Config $config
     if ($actualIp -ne [string]$config.expectedIp) {
@@ -77,19 +81,19 @@ if ((Test-Path -LiteralPath $plan.ConfigPath) -and -not $Force) {
     throw ('An installation already exists at {0}. Use -Force to replace it.' -f $InstallDir)
 }
 
+$monitors = @(Get-GuardMonitorProcesses)
+foreach ($monitor in $monitors) {
+    if (-not (Test-TextContainsDirectory -Text ([string]$monitor.ScriptPath) -Directory $InstallDir)) {
+        throw ('Another Claude IP Guard installation is already running its monitor: {0}. Close it before installing.' -f $monitor.InstallDir)
+    }
+}
+
 function Stop-InstalledGuard {
     param([string]$Directory)
 
-    try {
-        $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue)
-    } catch {
-        return
-    }
-
-    foreach ($process in $processes) {
-        $commandLine = [string]$process.CommandLine
-        if ($commandLine -like ('*' + $Directory + '*') -and $commandLine -like '*guard.ps1*') {
-            Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue
+    foreach ($monitor in @(Get-GuardMonitorProcesses)) {
+        if (Test-TextContainsDirectory -Text ([string]$monitor.ScriptPath) -Directory $Directory) {
+            Stop-Process -Id ([int]$monitor.ProcessId) -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -120,7 +124,7 @@ foreach ($file in @('status.ps1', 'uninstall.ps1', 'test.ps1')) {
 Write-GuardConfig -Config $config -Path $plan.ConfigPath
 
 $metadata = [pscustomobject]@{
-    version = '1.0.0'
+    version = '1.0.1'
     installedAt = (Get-Date).ToString('o')
     proxyType = $config.proxyType
     proxyHost = $config.proxyHost
@@ -180,12 +184,14 @@ wscript = "$(Join-Path $env:SystemRoot 'System32\wscript.exe')"
 guard = "$($plan.GuardVbs)"
 shell.Run Chr(34) & wscript & Chr(34) & " " & Chr(34) & guard & Chr(34), 0, False
 "@
-    [System.IO.File]::WriteAllText($plan.StartupEntry, $startup, (New-Object System.Text.UTF8Encoding($false)))
+    # The startup entry lives under a path that may contain non-ASCII user names.
+    # cscript.exe reads files as ANSI unless they carry a UTF-16LE byte order mark.
+    [System.IO.File]::WriteAllText($plan.StartupEntry, $startup, (New-Object System.Text.UnicodeEncoding($false, $true)))
 
     Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wscript.exe') -ArgumentList ('"' + $plan.GuardVbs + '"') -WindowStyle Hidden | Out-Null
 
     Start-Sleep -Seconds 1
-    if (-not (Test-TcpPort -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000)) {
+    if (-not (Test-TcpPort -TargetHost ([string]$config.proxyHost) -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000)) {
         Write-Warning 'The proxy port is not reachable after installation.'
     }
 }

@@ -1,7 +1,7 @@
 # Claude IP Guard — 设计文档
 
-- 状态：已实现（v1.0.0，已通过 55 个 Pester 单元测试）
-- 版本：1.0.0
+- 状态：已实现（v1.0.1，已通过 74 个 Pester 单元测试）
+- 版本：1.0.1
 - 日期：2026-11-17
 - 目标平台：Windows 10/11 x64，Windows PowerShell 5.1
 - 方案：B（轻量启动器 + 本地代理端口 + 目标出口 IP + 用户级监控）
@@ -46,12 +46,14 @@
 用户下载仓库后双击 install.cmd，按提示输入：
 
 1. 本地代理类型：HTTP（默认）或 SOCKS5。
-2. 本地代理端口：例如 1080（只允许本机回环地址）。
-3. 目标出口 IPv4：例如 203.0.113.10（文档中的示例地址，不是真实地址）。
+2. 本地代理主机：默认 127.0.0.1；如果代理只监听 IPv6 回环，可选 ::1。
+3. 本地代理端口：例如 1080（只允许本机回环地址）。
+4. 目标出口 IPv4：例如 203.0.113.10（文档中的示例地址，不是真实地址）。
 
 安装器会：
 
 - 校验端口和 IP 格式。
+- 安装前如果检测到另一份安装的监控正在运行，拒绝安装并提示先关闭它。
 - 检查本地代理端口是否可连接。
 - 通过该代理请求 Claude 的 trace 端点，确认实际出口 IP 与输入一致；不一致则拒绝安装，除非用户显式使用高级参数跳过。
 - 把程序复制到当前用户的本地目录，写入配置文件。
@@ -78,7 +80,7 @@
 
 status.cmd 输出：
 
-- 配置文件路径和脱敏后的配置摘要。
+- 配置文件路径和关键配置摘要（代理、目标出口 IP、检查间隔）。
 - 监控是否在运行。
 - 本地代理端口是否可连接。
 - 经代理访问 Claude trace 的当前出口 IP。
@@ -133,9 +135,9 @@ test.cmd 只做检查，不启动 Claude、不修改配置，用于安装后验�
 
 launch.ps1 流程：
 
-1. 读取并校验 config.json；配置无效则弹出错误，不启动 Claude。
-2. 检查本地代理端口是否可连接（TCP，超时 1 秒）。
-3. 通过代理请求 Claude trace（HTTPS，超时 8 秒），解析当前出口 IP。
+1. 读取并校验 config.json；配置无效则弹出错误，不启动 Claude。如果检测到另一份安装的监控正在运行，也弹出错误并退出。
+2. 检查本地代理端口是否可连接（TCP，使用配置中的 proxyHost（127.0.0.1 或 ::1），超时 1 秒）。
+3. 通过代理请求 Claude trace（HTTPS，超时 8 秒），解析当前出口 IP；SOCKS5 使用 socks5h 让代理端做 DNS 解析（远端 DNS），本地不解析，而启动 Claude 的 --proxy-server 仍是 socks5://（Chromium 默认远端解析），二者行为一致且不泄漏本地 DNS。
 4. 如果出口 IP 不等于目标 IP，弹出错误并退出；不启动 Claude。
 5. 检查现有 Claude 进程：
    - 如果只有受保护主进程，直接退出。
@@ -143,32 +145,36 @@ launch.ps1 流程：
 6. 确保监控已运行；没有则启动隐藏监控。
 7. 解析 Claude 可执行文件路径（见 4.4）。
 8. 启动 Claude：
-   - HTTP：--proxy-server=http://127.0.0.1:<port>
-   - SOCKS5：--proxy-server=socks5://127.0.0.1:<port>
+   - HTTP：--proxy-server=http://127.0.0.1:<port>（proxyHost 为 ::1 时写成 http://[::1]:<port>）
+   - SOCKS5：--proxy-server=socks5://127.0.0.1:<port>（proxyHost 为 ::1 时写成 socks5://[::1]:<port>）
    - 附加 --disable-quic
    - 附加 --webrtc-ip-handling-policy=disable_non_proxied_udp
-9. 等待 2 秒，检查新进程命令行是否包含正确的代理参数；不包含则关闭并报错。
+9. 启动后最多等待 20 秒，每 500 毫秒轮询一次，直到 Claude 主进程出现且命令行违规数为 0；超时则关闭已启动的 Claude 并报错。
 
 ### 4.2 监控
 
-guard.ps1 流程（每 3 秒）：
+guard.ps1 流程（默认每 3 秒）：
 
-1. 单实例互斥锁；已有实例则退出。
-2. 读取配置；配置无效视为故障，关闭 Claude 并记录。
+1. 获取固定名称的本地互斥锁 Local\ClaudeIPGuard-Monitor（同一登录会话内单实例；Local 命名空间按登录会话隔离）；获取失败说明已有监控在运行，记录警告后退出，避免两份不同配置互相杀 Claude。
+2. 读取配置；配置无效时记录 ERROR、关闭 Claude，但监控循环继续（不会退出）。
 3. 检查本地代理 TCP 端口；不可连接则关闭 Claude。
 4. 通过代理请求 Claude trace；出口 IP 不等于目标值则立即关闭 Claude。
-   - 连续 2 次请求失败也关闭 Claude，避免代理故障时 Claude 继续直连。
+   - 连续 2 次 trace 请求失败也关闭 Claude，避免代理故障时 Claude 继续直连。
    - 只有连续成功且 IP 一致才视为安全。
+   - 检查过程出现未处理异常时：单次异常记录 WARN 并继续，连续两次检查异常才关闭 Claude，成功一轮后计数清零。
 5. 只枚举 Claude Desktop 进程（WindowsApps 的 Claude_*\app\Claude.exe、Programs\Claude\Claude.exe，或名称精确为 Claude.exe 的进程）：
    - 明确排除 %USERPROFILE%\.local\bin\claude.exe（Claude Code CLI）。
    - 找出主进程（命令行不包含 --type= 的进程）。
-   - 没有主进程但存在 Desktop 子进程：视为异常，关闭全部 Desktop Claude 进程。
-   - 任一主进程的命令行不包含正确的 --proxy-server：关闭全部 Desktop Claude 进程。
+   - 没有主进程但存在 helper 子进程：给 5 秒宽限期，避免 Claude 正常退出时误报；超过宽限期仍只有 helper 则视为异常，关闭全部 Desktop Claude 进程。
+   - 主进程必须恰好有一个 --proxy-server 且值与配置一致；缺失、重复或值错误都视为违规。出现 --no-proxy-server、--proxy-bypass-list、--proxy-pac-url、--proxy-auto-detect 也视为违规，关闭全部 Desktop Claude 进程。
 6. TCP 连接审计：
-   - 对 Claude 进程的所有 TCP 连接，若远端是公网地址（非 127/8、10/8、172.16/12、192.168/16、169.254/16、::1、fc00::/7、fe80::/10），视为绕过代理，关闭 Claude。
+   - 对 Claude 进程的所有 TCP 连接，若远端是公网地址（非 127/8、10/8、172.16/12、192.168/16、169.254/16、100.64/10、0/8、::1、::、fc00::/7、fe80::/10；IPv4 映射的 IPv6 地址按 IPv4 判断），视为绕过代理，关闭 Claude。
+   - 其余地址（包括保留段）按公网处理（fail-closed），宁可误关也不放过意外的直连。
    - 如果查询连接失败（权限/系统限制），只记录警告，不单独因此关闭；出口 IP 和命令行检查仍然是强制的。
 7. 写日志；超过 1 MB 轮转，保留当前日志和 1 个旧文件。
-8. 睡眠 3 秒，重复。
+8. 睡眠配置的检查间隔（默认 3 秒），重复。
+
+所有日志都通过安全写入函数（Write-GuardLogSafe）记录；日志写入失败会被忽略，不会让监控退出。
 
 ### 4.3 关闭策略
 
@@ -235,6 +241,7 @@ guard.ps1 流程（每 3 秒）：
 install.ps1 支持：
 
 - -ProxyType http|socks5
+- -ProxyHost <127.0.0.1|::1>（默认 127.0.0.1；代理只监听 IPv6 回环时用 ::1）
 - -ProxyPort <int>
 - -ExpectedIp <ipv4>
 - -InstallDir <path>（默认 %LOCALAPPDATA%\ClaudeIPGuard）
@@ -279,6 +286,7 @@ install.ps1 支持：
 - 启动快捷方式目标：%SystemRoot%\System32\wscript.exe，参数："<install>\src\launch.vbs"。
 - 图标：如果找到 Claude 可执行文件，使用其图标；否则使用系统默认图标。
 - 启动文件夹中的 Claude IP Guard Monitor.vbs 直接由系统登录时执行；脚本自身隐藏启动 guard.ps1。
+- 启动项 VBS 以 UTF-16LE BOM 写入：cscript 默认按 ANSI 读取，路径含中文用户名时需要 BOM 才能正确解析。
 - 卸载时只删除本工具创建的快捷方式，通过文件名和安装目录匹配，不删除其他 Claude 快捷方式。
 
 ### 5.4 卸载器
@@ -291,12 +299,15 @@ uninstall.ps1：
 4. 可选删除安装目录；默认保留日志，提示用户路径。
 5. 不删除 Claude，不修改 Claude 数据，不修改系统网络设置。
 
+进程命令行和快捷方式内容都做字面路径匹配：目录末尾带路径分隔符，比较时大小写不敏感，不使用通配符；这样安装目录含 [ ] * ? 时不会失效，也不会误删 ClaudeIPGuard2 这类同前缀目录的文件。
+
 ## 6. 安全、隐私与失败模式
 
 ### 6.1 安全
 
 - 只接受回环地址作为代理主机，避免凭据/流量被发到局域网。
 - 安装时和运行时都校验出口 IP。
+- 出口 IP 检测对 SOCKS5 使用 socks5h 让代理端做远端 DNS 解析，避免本地 DNS 泄漏或被污染导致误杀；启动 Claude 的参数仍是 socks5://（由 Chromium 远端解析），二者行为一致。
 - 启动参数包含 --disable-quic 和 --webrtc-ip-handling-policy=disable_non_proxied_udp，减少 UDP/WebRTC 绕过。
 - 监控检查主进程参数和公网 TCP 连接；异常即关闭 Claude。
 - 不使用 Invoke-Expression 执行外部输入；配置只按 JSON 读取和类型校验。
@@ -306,7 +317,7 @@ uninstall.ps1：
 ### 6.2 隐私
 
 - 不收集遥测，不上传日志，不访问除 Claude trace 之外的检测端点。
-- 日志只保存在本机，包含时间、事件、进程 ID、出口 IP（可选脱敏）。
+- 日志只保存在本机，包含时间、事件、进程 ID、出口 IP，不做脱敏；公开分享日志前需要自行删除其中的 IP、路径等信息。
 - 仓库不包含任何真实 IP、用户名、主机名、代理服务商、订阅地址或令牌。
 - README 中的示例使用保留地址（如 203.0.113.10）和通用端口（如 1080）。
 
@@ -316,13 +327,17 @@ uninstall.ps1：
 |---|---|
 | 代理端口未监听 | 启动器拒绝启动；监控关闭 Claude |
 | 出口 IP 不等于目标 | 启动器拒绝启动；监控立即关闭 Claude |
-| 连续 2 次检测失败 | 监控关闭 Claude |
+| 连续 2 次 trace 请求失败 | 监控关闭 Claude |
 | Claude 主进程无代理参数 | 监控关闭 Claude |
+| Claude 主进程有重复或旁路代理参数 | 监控关闭 Claude |
 | Claude 有公网 TCP 直连 | 监控关闭 Claude |
+| 监控内部检查异常 | 单次记录 WARN 并继续；连续两次检查异常才关闭 Claude，成功一轮后清零 |
+| 日志写入失败 | 忽略，不影响监控循环 |
+| 另一安装的监控已在运行 | 启动器/安装器拒绝启动并提示；重复启动的监控自身记录警告后退出 |
 | 监控未运行 | 保护失效；启动器会尝试启动；README 说明边界 |
 | Claude 更新导致路径变化 | 启动器重新发现；失败时提示配置 claudeExe |
 | 用户从原始图标启动 | 监控在 3 秒内关闭未受保护实例 |
-| 配置损坏 | 监控关闭 Claude 并记录；启动器拒绝启动 |
+| 配置损坏 | 监控记录 ERROR 并关闭 Claude，随后按周期重试，不退出；启动器拒绝启动 |
 
 ## 7. 文件结构（GitHub 仓库）
 
@@ -352,9 +367,6 @@ uninstall.ps1：
         PRIVACY.md
       tests/
         ClaudeIPGuard.Tests.ps1
-        Fixtures/
-          config.valid.json
-          config.invalid.json
       .github/
         workflows/
           test.yml
@@ -363,6 +375,7 @@ uninstall.ps1：
 
 - src/ClaudeIPGuard.psm1 放置可测试的纯函数和进程/网络检查函数。
 - launch.ps1、guard.ps1 只做编排，便于测试。
+- tests/ 下只有 ClaudeIPGuard.Tests.ps1，测试使用桩程序与假进程对象，不需要 fixture 文件。
 - .cmd 文件是双击入口，内部使用 powershell -NoProfile -ExecutionPolicy Bypass -File。
 - 不包含二进制、驱动、Mihomo 配置或任何特定代理软件配置。
 
@@ -372,16 +385,20 @@ uninstall.ps1：
 
 覆盖：
 
-- 配置读取：合法、缺字段、端口越界、IP 非法、代理主机非回环。
-- 代理 URL 构造：HTTP/SOCKS5。
-- 命令行参数检查：正确端口、错误端口、缺失参数、带引号参数。
+- 配置读取：合法、缺字段、端口越界、IP 非法、代理主机非回环、expectedIp 规范化。
+- 代理 URL 构造：HTTP/SOCKS5、::1 主机、SOCKS5 远端 DNS（socks5h）。
+- 启动参数：正确端口、错误端口、缺失参数、带引号参数。
+- 命令行检查：重复 --proxy-server，以及 --no-proxy-server、--proxy-bypass-list、--proxy-pac-url、--proxy-auto-detect 等旁路参数。
 - 主进程识别：主进程、Electron 子进程、只有子进程。
-- TCP 连接分类：回环、私网、公网、查询失败。
+- TCP 连接分类：回环、私网、公网、查询失败、IPv6 回环与私网。
 - 出口 IP 解析：正常 ip=、空响应、HTML 错误页。
 - 关闭决策：IP 不一致、连续失败、配置损坏、未受保护。
+- 日志：轮转保留 1 份旧文件、安全写入忽略写入失败。
+- 路径与进程识别：字面路径匹配、监控进程识别。
+- TCP 端口检查：IPv4 与 IPv6 回环监听。
 - 快捷方式/安装计划：-DryRun 不写文件，路径在用户目录内。
 
-测试全部使用 mock，不访问真实网络、不启动真实 Claude、不修改系统。当前共 55 个测试。
+测试使用桩程序与假进程对象，不访问真实网络、不启动真实 Claude、不修改系统。当前共 74 个测试。另有两个静态测试检查 guard.ps1 的失败安全不变式（放弃的互斥锁按已获取处理、检查异常计数只在完整成功一轮后清零）。
 
 ### 8.2 集成测试（手动）
 
@@ -400,9 +417,8 @@ uninstall.ps1：
 
 GitHub Actions windows-latest：
 
-- 安装 Pester 5。
-- 运行 Invoke-Pester -Path tests -CI。
-- 可选运行 PSScriptAnalyzer；只报告，不因信息级告警失败。
+- 用 pwsh 安装 Pester 5（两种 shell 共享 CurrentUser 模块路径）。
+- 测试步骤通过 matrix（fail-fast: false，matrix.shell 为 powershell / pwsh）分别在 Windows PowerShell 5.1 和 PowerShell 7 下运行 Invoke-Pester -Path ./tests -PassThru -Output Detailed，并检查 FailedCount。
 
 ## 9. 决策记录
 
@@ -413,13 +429,17 @@ GitHub Actions windows-latest：
 5. 选择用户级启动文件夹而不是计划任务：无需管理员，安装/卸载简单；代价是用户可在任务管理器禁用。
 6. 不内置代理软件：保持通用、可审计、无供应商绑定；用户已有本地代理端口。
 7. v1 不覆盖 Claude Code：Claude Code 通过环境变量代理，缺少可靠的进程级参数标记；先保证 Desktop，避免给出虚假的安全承诺。
+8. 监控内部错误与日志写入采用分级处理：单次检查异常只警告，连续两次才关闭 Claude；日志写入失败被忽略。既不静默退出（fail-open），也不因单次抖动误杀。
+9. 监控使用 Local 命名空间下固定名称的互斥锁，保证同一登录会话同一时刻只有一个监控，避免两份不同配置的监控互相杀 Claude。
+10. 出口 IP 检测对 SOCKS5 使用 socks5h（远端 DNS），避免本地 DNS 泄漏和污染导致的误判；启动 Claude 仍用 socks5://。
 
 ## 10. 限制与风险
 
 - 不是内核级防火墙；用户主动停用监控后无法强制。
 - 从原始图标启动有最多约 3 秒窗口；期间可能产生少量直连流量。
 - 代理必须支持 HTTP CONNECT 或 SOCKS5，且无需认证。
-- 只校验 IPv4 出口。
+- 代理主机可以是 ::1，但只校验 IPv4 出口。
+- 同一登录会话同一时刻只支持一个监控实例；同一会话内两份不同安装不能同时运行（不同登录会话互不影响）。
 - 关闭 Claude 可能导致未发送的输入丢失。
 - 如果本地代理端口被其他程序占用/替换，插件只能通过出口 IP 发现异常，不能验证代理软件本身。
 - Claude 更新可能改变可执行文件路径或参数行为；启动器会重新发现，但需要时更新插件。

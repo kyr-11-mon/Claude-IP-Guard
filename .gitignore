@@ -9,6 +9,9 @@ logs/
 .vbs-test/
 TestResults/
 
+# Local agent session memory
+.memsearch/
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

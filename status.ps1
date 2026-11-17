@@ -33,15 +33,15 @@ Write-Host ('Check interval: {0}s' -f $config.checkIntervalSeconds)
 
 $guardProcesses = @()
 try {
-    $guardProcesses = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue | Where-Object {
-        ([string]$_.CommandLine) -like ('*' + $InstallDir + '*') -and ([string]$_.CommandLine) -like '*guard.ps1*'
+    $guardProcesses = @(Get-GuardMonitorProcesses | Where-Object {
+        Test-TextContainsDirectory -Text ([string]$_.ScriptPath) -Directory $InstallDir
     })
 } catch {
     $guardProcesses = @()
 }
 Write-Host ('Monitor running: {0}' -f ($guardProcesses.Count -gt 0))
 
-$portOk = Test-TcpPort -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000
+$portOk = Test-TcpPort -TargetHost ([string]$config.proxyHost) -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000
 Write-Host ('Proxy port reachable: {0}' -f $portOk)
 
 if ($portOk) {
@@ -70,7 +70,7 @@ if ($processes.Count -gt 0) {
 
 if (Test-Path -LiteralPath $logPath -PathType Leaf) {
     Write-Host 'Recent log lines:'
-    Get-Content -LiteralPath $logPath -Tail 8 | ForEach-Object { Write-Host ('  ' + $_) }
+    Get-Content -LiteralPath $logPath -Tail 8 -Encoding UTF8 | ForEach-Object { Write-Host ('  ' + $_) }
 }
 
 exit 0

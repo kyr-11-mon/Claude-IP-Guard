@@ -27,7 +27,8 @@ Claude IP Guard 的做法是：
   - Claude Desktop 主进程是否仍带正确的代理参数；
   - Claude 是否出现公网 TCP 直连。
 - **失败处理**：代理不可用、IP 不符、进程参数缺失或出现公网直连时，立即结束 Claude Desktop 进程。连续两次无法取得出口 IP 也会结束 Claude。
-- **单实例**：监控使用本地互斥锁，重复启动不会产生多个监控进程。
+- **失败安全**：监控自身的日志写入或检查出错不会让监控静默退出；单次检查异常只记录警告，连续两次检查异常才关闭 Claude。
+- **单实例（当前登录会话）**：监控使用 `Local` 命名空间下固定名称的互斥锁，同一登录会话内重复启动不会产生多个监控进程；另一份安装的监控会记录警告后退出，避免两份不同配置互相杀 Claude。不同登录会话（如快速用户切换、RDP）各自独立。
 
 ## 系统要求
 
@@ -94,6 +95,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
 | --- | --- |
 | `-ProxyType http\|socks5` | 本地代理类型，默认 `http` |
 | `-ProxyPort <1-65535>` | 本地代理端口；省略时交互输入 |
+| `-ProxyHost <127.0.0.1\|::1>` | 本地代理主机，默认 `127.0.0.1`；代理只监听 IPv6 回环时用 `::1` |
 | `-ExpectedIp <IPv4>` | 目标出口 IPv4；省略时交互输入 |
 | `-ClaudeExe <path>` | 手动指定 Claude Desktop 的 `Claude.exe`；默认自动查找 |
 | `-InstallDir <path>` | 自定义安装目录，默认 `%LOCALAPPDATA%\ClaudeIPGuard` |
@@ -139,7 +141,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
 | `proxyType` | `http` 或 `socks5` |
 | `proxyHost` | 只允许 `127.0.0.1` 或 `::1` |
 | `proxyPort` | 1–65535 |
-| `expectedIp` | 必须是 IPv4 地址 |
+| `expectedIp` | 必须是 IPv4 地址；读取时会规范化为标准写法（如 `127.1` 写回 `127.0.0.1`） |
 | `claudePackageName` | Claude 的 Appx 包名，默认 `Claude` |
 | `claudeExe` | 可选，手动指定 `Claude.exe` 完整路径 |
 | `checkIntervalSeconds` | 检查间隔，1–30 秒，默认 3 |
@@ -178,7 +180,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ClaudeIPG
 - **只保护通过启动器启动的 Claude。** 原始快捷方式不会被劫持；从原始图标启动的实例会在监控周期内被关闭。
 - **直接结束进程。** 失败时不会优雅退出，可能丢失未发送的输入。
 - **不是内核级拦截。** 它通过进程参数、出口 IP 和 TCP 连接检查来发现异常；有管理员权限的恶意程序、被篡改的 Claude、或代理提供方自身的行为不在防护范围内。
-- **只有 IPv4。** `expectedIp` 必须是 IPv4；IPv6 出口不在校验范围内。
+- **只有 IPv4 出口。** `expectedIp` 必须是 IPv4；IPv6 出口不在校验范围内。代理主机可以是 `::1`，但代理只监听 IPv6 回环时才需要这样配置。
 - **代理必须无认证。** v1 不支持用户名/密码；代理端口应只监听回环地址，不要暴露到局域网。
 - **最多一个检查间隔的窗口。** 默认 3 秒；从原始图标启动、代理切换节点到监控发现异常之间，可能存在短暂窗口。
 - **其他应用不受影响。** 这是设计目标，也意味着本工具不是全局 VPN。
@@ -228,7 +230,7 @@ Import-Module Pester -MinimumVersion 5.0
 Invoke-Pester -Path .\tests -Output Detailed
 ```
 
-当前 55 个 Pester 测试，覆盖配置校验、代理 URL、启动参数、trace 解析、公网地址判断、进程识别、违规判断、连接过滤、日志轮转、安装计划等。测试不访问真实网络，不启动真实 Claude。
+当前 74 个 Pester 测试，覆盖配置校验、代理 URL、启动参数、trace 解析、公网地址判断、进程识别、违规判断（含重复与旁路代理参数）、连接过滤、日志轮转与安全写入、路径匹配、监控进程识别、安装计划、监控脚本失败安全不变式等。测试不访问真实网络，不启动真实 Claude。CI 分别在 Windows PowerShell 5.1 和 PowerShell 7 下运行。
 
 设计文档见 [docs/DESIGN.md](docs/DESIGN.md)。
 

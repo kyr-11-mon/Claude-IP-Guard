@@ -38,6 +38,13 @@ Most failures fall into one of these groups:
    it. Configure an unauthenticated local port, bound to `127.0.0.1`.
 5. If the port is only listening on another interface, change the proxy client
    to listen on loopback.
+6. If the proxy only listens on the IPv6 loopback, install or reconfigure with
+   `-ProxyHost ::1` (or set `proxyHost` to `::1` in `config.json`) and
+   verify it with:
+
+   ```powershell
+   Test-NetConnection ::1 -Port 1080
+   ```
 
 ## "The proxy exit IP is ... not the requested ..."
 
@@ -51,6 +58,14 @@ through your proxy. Check it manually:
 
 ```powershell
 curl.exe --proxy http://127.0.0.1:1080 https://claude.ai/cdn-cgi/trace
+```
+
+For SOCKS5 proxies, the exit-IP check uses `socks5h`, so the proxy resolves the
+DNS name remotely. The tool does not rely on local DNS: a poisoned local DNS
+configuration cannot change the detected exit IP. To check manually, use:
+
+```powershell
+curl.exe --proxy socks5h://127.0.0.1:1080 https://claude.ai/cdn-cgi/trace
 ```
 
 - If the output has no `ip=` line, the proxy is not passing HTTPS or is
@@ -118,6 +133,11 @@ If it exits immediately:
    The shortcuts already pass `-ExecutionPolicy Bypass`. If you launch the
    `.ps1` manually, use the same flag.
 
+4. If you recently installed a second copy of Claude IP Guard, search
+   `guard.log` for the `another Claude IP Guard monitor is already running`
+   warning described in the next section. A failed log write does not stop the
+   monitor.
+
 The login entry is:
 
 ```text
@@ -125,6 +145,19 @@ The login entry is:
 ```
 
 If it is missing, rerun `install.cmd` without `-NoShortcuts`.
+
+## Another installation's monitor is already running
+
+Only one monitor may run per logon session. Each monitor holds the
+session-wide mutex `Local\ClaudeIPGuard-Monitor`; the second monitor logs
+`another Claude IP Guard monitor is already running; this instance will not
+start` to its `guard.log` and exits.
+
+If the launcher or installer reports `Another Claude IP Guard installation ...
+is already running its monitor`, either close or uninstall the other
+installation, or use the same installation directory. Two installations with
+different proxy settings cannot run at the same time, because each monitor
+would close the Claude that the other one started.
 
 ## Claude Desktop cannot be found
 
@@ -191,8 +224,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ClaudeIPG
 %LOCALAPPDATA%\ClaudeIPGuard\logs\guard.log.1
 ```
 
-Logs rotate at 1 MB. They contain monitor decisions and error messages, not
-Claude conversation content. Remove or redact paths before sharing publicly.
+Logs rotate at 1 MB and keep one old file (`guard.log.1`). They contain
+monitor decisions and error messages, not Claude conversation content. Remove
+or redact paths before sharing publicly.
 
 ## Still stuck
 

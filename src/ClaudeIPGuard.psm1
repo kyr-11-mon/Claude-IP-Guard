@@ -1,6 +1,6 @@
 Set-StrictMode -Version Latest
 
-$script:GuardVersion = '1.0.0'
+$script:GuardVersion = '1.0.1'
 
 function Test-GuardConfig {
     [CmdletBinding()]
@@ -48,6 +48,50 @@ function Test-GuardConfig {
     return $true
 }
 
+function Get-NormalizedExpectedIp {
+    param(
+        [AllowNull()]
+        [string]$Address
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Address)) {
+        return $Address
+    }
+
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($Address, [ref]$ip) -and
+        $ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        return $ip.IPAddressToString
+    }
+
+    return $Address
+}
+
+function Test-TextContainsDirectory {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Text,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text) -or [string]::IsNullOrWhiteSpace($Directory)) {
+        return $false
+    }
+
+    $normalized = $Directory.TrimEnd('\', '/')
+    if ($normalized.Length -eq 0) {
+        return $false
+    }
+
+    # The trailing separator avoids matching a sibling directory whose name
+    # starts with the same characters (ClaudeIPGuard vs. ClaudeIPGuard2), and
+    # IndexOf is literal, so [ ] * ? in a directory name are not wildcards.
+    return ($Text.IndexOf(($normalized + '\'), [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
 function New-GuardConfig {
     [CmdletBinding()]
     param(
@@ -80,6 +124,7 @@ function New-GuardConfig {
     }
 
     Test-GuardConfig -Config $config | Out-Null
+    $config.expectedIp = Get-NormalizedExpectedIp -Address $ExpectedIp
     return $config
 }
 
@@ -87,7 +132,9 @@ function Get-ProxyUrl {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [object]$Config
+        [object]$Config,
+
+        [switch]$SocksRemoteDns
     )
 
     Test-GuardConfig -Config $Config | Out-Null
@@ -95,7 +142,13 @@ function Get-ProxyUrl {
     if ($hostPart -eq '::1') {
         $hostPart = '[::1]'
     }
-    return ('{0}://{1}:{2}' -f $Config.proxyType, $hostPart, $Config.proxyPort)
+    $scheme = [string]$Config.proxyType
+    if ($SocksRemoteDns -and $scheme -eq 'socks5') {
+        # curl resolves SOCKS5 proxy targets locally; socks5h resolves them on
+        # the proxy side, matching Chromium's --proxy-server=socks5 behavior.
+        $scheme = 'socks5h'
+    }
+    return ('{0}://{1}:{2}' -f $scheme, $hostPart, $Config.proxyPort)
 }
 
 function Get-ClaudeLaunchArguments {
@@ -152,6 +205,9 @@ function Test-PublicAddress {
         $ip = $ip.MapToIPv4()
     }
 
+    # Only well-known local/private ranges are skipped. Anything else, including
+    # special-purpose ranges, counts as public on purpose: an unexpected direct
+    # connection should fail closed rather than be exempted by a heuristic.
     $bytes = $ip.GetAddressBytes()
     if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
         if ($bytes[0] -eq 10) { return $false }
@@ -229,7 +285,9 @@ function Get-ClaudeProcessViolations {
         [object[]]$Processes,
 
         [Parameter(Mandatory = $true)]
-        [object]$Config
+        [object]$Config,
+
+        [switch]$IgnoreOrphanHelpers
     )
 
     Test-GuardConfig -Config $Config | Out-Null
@@ -247,21 +305,44 @@ function Get-ClaudeProcessViolations {
 
     $main = @(Get-ClaudeMainProcesses -Processes $claudeProcesses)
     if ($main.Count -eq 0) {
-        $violations.Add('Claude helper processes are running without a main process.')
+        if (-not $IgnoreOrphanHelpers) {
+            $violations.Add('Claude helper processes are running without a main process.')
+        }
         return @($violations)
     }
 
     $expected = Get-ProxyUrl -Config $Config
+    $forbiddenSwitches = @(
+        '--no-proxy-server'
+        '--proxy-bypass-list'
+        '--proxy-pac-url'
+        '--proxy-auto-detect'
+    )
+
     foreach ($process in $main) {
         $cmd = ([string]$process.CommandLine) -replace '"', '' -replace "'", ''
-        $match = [regex]::Match($cmd, '(?:^|\s)--proxy-server(?:=|\s+)(\S+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        $processId = 0
+        [int]::TryParse([string]$process.ProcessId, [ref]$processId) | Out-Null
+
+        $proxyMatches = @([regex]::Matches($cmd, '(?:^|\s)--proxy-server(?:=|\s+)(\S+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase))
         $actual = $null
-        if ($match.Success) {
-            $actual = $match.Groups[1].Value.TrimEnd(',')
+        if ($proxyMatches.Count -ge 1) {
+            $actual = $proxyMatches[0].Groups[1].Value.TrimEnd(',')
         }
 
-        if ([string]::IsNullOrWhiteSpace($actual) -or $actual -ne $expected) {
-            $violations.Add(('Claude main process {0} is not using the required proxy.' -f $process.ProcessId))
+        if ($proxyMatches.Count -gt 1) {
+            # Chromium honors the last switch, so a duplicate can silently
+            # override the proxy that this guard verified.
+            $violations.Add(('Claude main process {0} has multiple --proxy-server arguments.' -f $processId))
+        } elseif ([string]::IsNullOrWhiteSpace($actual) -or $actual -ne $expected) {
+            $violations.Add(('Claude main process {0} is not using the required proxy.' -f $processId))
+        }
+
+        foreach ($switchName in $forbiddenSwitches) {
+            $pattern = '(?:^|\s)' + [regex]::Escape($switchName) + '(?:=|\s|$)'
+            if ($cmd -match $pattern) {
+                $violations.Add(('Claude main process {0} uses a proxy bypass argument: {1}.' -f $processId, $switchName))
+            }
         }
     }
 
@@ -307,7 +388,15 @@ function Test-TcpPort {
         throw 'TimeoutMilliseconds must be greater than zero.'
     }
 
-    $client = New-Object System.Net.Sockets.TcpClient
+    # A parameterless TcpClient is IPv4-only on Windows PowerShell 5.1, so an
+    # IPv6 proxy host such as ::1 would always look unreachable.
+    $parsedAddress = $null
+    if ([System.Net.IPAddress]::TryParse($TargetHost, [ref]$parsedAddress)) {
+        $client = New-Object System.Net.Sockets.TcpClient($parsedAddress.AddressFamily)
+    } else {
+        $client = New-Object System.Net.Sockets.TcpClient
+    }
+
     try {
         $async = $client.BeginConnect($TargetHost, $Port, $null, $null)
         if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) {
@@ -472,7 +561,7 @@ function Invoke-TraceRequest {
         '--show-error',
         '--fail',
         '--max-time', [string]$TimeoutSeconds,
-        '--proxy', (Get-ProxyUrl -Config $Config),
+        '--proxy', (Get-ProxyUrl -Config $Config -SocksRemoteDns),
         $TraceUrl
     )
 
@@ -525,7 +614,7 @@ function Write-GuardLog {
 
         [int]$MaxBytes = 1048576,
 
-        [int]$Keep = 2
+        [int]$Keep = 1
     )
 
     if ($MaxBytes -lt 1) {
@@ -562,6 +651,28 @@ function Write-GuardLog {
     [System.IO.File]::AppendAllText($LogPath, $line, $encoding)
 }
 
+function Write-GuardLogSafe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $true)]
+        [string]$LogPath,
+
+        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO'
+    )
+
+    try {
+        Write-GuardLog -Message $Message -LogPath $LogPath -Level $Level
+    } catch {
+        # A monitoring guard must keep running even when the log can no longer
+        # be written (full disk, changed ACLs, locked file). There is nowhere
+        # left to report the logging failure itself.
+    }
+}
+
 function Read-GuardConfig {
     [CmdletBinding()]
     param(
@@ -574,7 +685,7 @@ function Read-GuardConfig {
     }
 
     try {
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
         $config = $raw | ConvertFrom-Json -ErrorAction Stop
     } catch {
         throw 'Configuration is not valid JSON.'
@@ -587,6 +698,7 @@ function Read-GuardConfig {
     }
 
     Test-GuardConfig -Config $config | Out-Null
+    $config.expectedIp = Get-NormalizedExpectedIp -Address ([string]$config.expectedIp)
     return $config
 }
 
@@ -632,12 +744,14 @@ function Get-GuardDecision {
         [AllowNull()]
         [object[]]$Connections,
 
-        [bool]$ConnectionQuerySucceeded = $true
+        [bool]$ConnectionQuerySucceeded = $true,
+
+        [switch]$IgnoreOrphanHelpers
     )
 
     Test-GuardConfig -Config $Config | Out-Null
     $reasons = New-Object System.Collections.Generic.List[string]
-    $violations = @(Get-ClaudeProcessViolations -Processes $Processes -Config $Config)
+    $violations = @(Get-ClaudeProcessViolations -Processes $Processes -Config $Config -IgnoreOrphanHelpers:$IgnoreOrphanHelpers)
     $publicConnections = @()
     if ($ConnectionQuerySucceeded) {
         $publicConnections = @(Get-PublicConnections -Connections $Connections)
@@ -780,6 +894,60 @@ function Stop-ClaudeProcesses {
     return @($killed)
 }
 
+function Get-GuardMonitorProcesses {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object[]]$Processes
+    )
+
+    if ($null -eq $Processes) {
+        try {
+            $Processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue)
+        } catch {
+            return @()
+        }
+    }
+
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($process in @($Processes)) {
+        if ($null -eq $process) { continue }
+
+        $commandLine = [string]$process.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) { continue }
+
+        $fileMatch = [regex]::Match($commandLine, '(?i)-File\s+"([^"]+)"')
+        if (-not $fileMatch.Success) {
+            $fileMatch = [regex]::Match($commandLine, '(?i)-File\s+(\S+)')
+        }
+        if (-not $fileMatch.Success) { continue }
+
+        $scriptPath = $fileMatch.Groups[1].Value.Trim('"', "'")
+        if ([System.IO.Path]::GetFileName($scriptPath) -ine 'guard.ps1') { continue }
+
+        $installDir = ''
+        $srcDir = [System.IO.Path]::GetDirectoryName($scriptPath)
+        if (-not [string]::IsNullOrWhiteSpace($srcDir) -and [System.IO.Path]::GetFileName($srcDir) -ieq 'src') {
+            $installDir = [System.IO.Path]::GetDirectoryName($srcDir)
+        }
+        if ([string]::IsNullOrWhiteSpace($installDir)) {
+            $installDir = $srcDir
+        }
+
+        $processId = 0
+        [int]::TryParse([string]$process.ProcessId, [ref]$processId) | Out-Null
+
+        $result.Add([pscustomobject]@{
+            ProcessId = $processId
+            CommandLine = $commandLine
+            ScriptPath = $scriptPath
+            InstallDir = $installDir
+        })
+    }
+
+    return $result.ToArray()
+}
+
 Export-ModuleMember -Function @(
     'Test-GuardConfig'
     'New-GuardConfig'
@@ -796,10 +964,13 @@ Export-ModuleMember -Function @(
     'Invoke-TraceRequest'
     'Get-CurrentExitIp'
     'Write-GuardLog'
+    'Write-GuardLogSafe'
     'Read-GuardConfig'
     'Write-GuardConfig'
     'Get-GuardDecision'
     'New-InstallPlan'
     'Get-ClaudeConnections'
     'Stop-ClaudeProcesses'
+    'Test-TextContainsDirectory'
+    'Get-GuardMonitorProcesses'
 )

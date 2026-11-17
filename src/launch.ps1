@@ -9,8 +9,8 @@ $ErrorActionPreference = 'Stop'
 $modulePath = Join-Path $PSScriptRoot 'ClaudeIPGuard.psm1'
 Import-Module $modulePath -Force
 
-$script:GuardScriptPath = Join-Path $PSScriptRoot 'guard.ps1'
 $installRoot = Split-Path -Parent $PSScriptRoot
+$guardScriptPath = Join-Path $PSScriptRoot 'guard.ps1'
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $installRoot 'config.json'
 }
@@ -34,27 +34,26 @@ function Show-GuardMessage {
     }
 }
 
-function Test-GuardRunning {
-    try {
-        $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop)
-        foreach ($process in $processes) {
-            if ([string]$process.CommandLine -like ('*' + $script:GuardScriptPath + '*')) {
-                return $true
-            }
+function Get-GuardState {
+    $ownRunning = $false
+    $foreignMonitor = $null
+    foreach ($monitor in @(Get-GuardMonitorProcesses)) {
+        if (Test-TextContainsDirectory -Text ([string]$monitor.ScriptPath) -Directory $installRoot) {
+            $ownRunning = $true
+        } elseif ($null -eq $foreignMonitor) {
+            $foreignMonitor = $monitor
         }
-    } catch {
-        return $false
     }
-    return $false
+
+    return [pscustomobject]@{
+        OwnMonitorRunning = $ownRunning
+        ForeignMonitor = $foreignMonitor
+    }
 }
 
 function Start-GuardProcess {
-    if (Test-GuardRunning) {
-        return
-    }
-
     $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $guardScript = $script:GuardScriptPath
+    $guardScript = $guardScriptPath
     $arguments = @(
         '-NoProfile'
         '-WindowStyle'
@@ -72,9 +71,16 @@ try {
         throw ('Configuration file was not found: {0}' -f $ConfigPath)
     }
 
+    # A monitor from another install root would keep stopping this Claude session
+    # whenever the two configurations disagree, so refuse to start instead.
+    $guardState = Get-GuardState
+    if ($null -ne $guardState.ForeignMonitor) {
+        throw ('Another Claude IP Guard installation ({0}) is already running its monitor. Close it before launching this installation.' -f $guardState.ForeignMonitor.InstallDir)
+    }
+
     $config = Read-GuardConfig -Path $ConfigPath
-    if (-not (Test-TcpPort -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000)) {
-        throw ('The local proxy port {0} is not accepting connections.' -f $config.proxyPort)
+    if (-not (Test-TcpPort -TargetHost ([string]$config.proxyHost) -Port ([int]$config.proxyPort) -TimeoutMilliseconds 1000)) {
+        throw ('The local proxy port {0} on {1} is not accepting connections.' -f $config.proxyPort, $config.proxyHost)
     }
 
     $exitIp = Get-CurrentExitIp -Config $config
@@ -86,7 +92,9 @@ try {
     if ($processes.Count -gt 0) {
         $violations = @(Get-ClaudeProcessViolations -Processes $processes -Config $config)
         if ($violations.Count -eq 0) {
-            Start-GuardProcess
+            if (-not $guardState.OwnMonitorRunning) {
+                Start-GuardProcess
+            }
             return
         }
 
@@ -104,19 +112,32 @@ try {
         Start-Sleep -Milliseconds 500
     }
 
-    Start-GuardProcess
+    if (-not $guardState.OwnMonitorRunning) {
+        Start-GuardProcess
+    }
 
     $claudeExe = Find-ClaudeExecutable -Config $config
     $arguments = @(Get-ClaudeLaunchArguments -Config $config)
     Start-Process -FilePath $claudeExe -ArgumentList $arguments -WorkingDirectory (Split-Path -Parent $claudeExe) | Out-Null
 
-    Start-Sleep -Seconds 2
-    $started = @(Get-ClaudeProcesses)
-    $bad = @(Get-ClaudeProcessViolations -Processes $started -Config $config)
-    if ($started.Count -eq 0 -or $bad.Count -gt 0) {
-        Stop-ClaudeProcesses -Processes $started | Out-Null
-        throw 'Claude did not start with the required proxy arguments.'
+    # MSIX cold start can take much longer than two seconds. Poll instead of
+    # sleeping once, otherwise a slow but legitimate start is killed by mistake.
+    $deadline = (Get-Date).AddSeconds(20)
+    $started = @()
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $started = @(Get-ClaudeProcesses)
+        if ($started.Count -eq 0) {
+            continue
+        }
+        $bad = @(Get-ClaudeProcessViolations -Processes $started -Config $config)
+        if ($bad.Count -eq 0) {
+            return
+        }
     }
+
+    Stop-ClaudeProcesses -Processes $started | Out-Null
+    throw 'Claude did not start with the required proxy arguments within 20 seconds.'
 } catch {
     Show-GuardMessage -Message $_.Exception.Message
     exit 1

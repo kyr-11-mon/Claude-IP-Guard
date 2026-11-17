@@ -1,5 +1,6 @@
 BeforeAll {
     $script:ModulePath = Join-Path $PSScriptRoot '..\src\ClaudeIPGuard.psm1'
+    $script:GuardScriptPath = Join-Path $PSScriptRoot '..\src\guard.ps1'
     Import-Module $script:ModulePath -Force
 }
 
@@ -40,6 +41,11 @@ Describe 'Test-GuardConfig' {
         { Test-GuardConfig -Config $script:valid } | Should -Throw
     }
 
+    It 'accepts an IPv6 loopback proxy host' {
+        $script:valid.proxyHost = '::1'
+        { Test-GuardConfig -Config $script:valid } | Should -Not -Throw
+    }
+
     It 'rejects an unknown proxy type' {
         $script:valid.proxyType = 'ftp'
         { Test-GuardConfig -Config $script:valid } | Should -Throw
@@ -60,6 +66,11 @@ Describe 'New-GuardConfig' {
         $config.expectedIp | Should -Be '203.0.113.10'
         $config.checkIntervalSeconds | Should -Be 3
     }
+
+    It 'normalizes an abbreviated IPv4 address' {
+        $config = New-GuardConfig -ProxyPort 1080 -ExpectedIp '127.1'
+        $config.expectedIp | Should -Be '127.0.0.1'
+    }
 }
 
 Describe 'Get-ProxyUrl' {
@@ -71,6 +82,21 @@ Describe 'Get-ProxyUrl' {
     It 'builds a SOCKS5 proxy URL' {
         $config = New-GuardConfig -ProxyType socks5 -ProxyPort 1080 -ExpectedIp '203.0.113.10'
         Get-ProxyUrl -Config $config | Should -Be 'socks5://127.0.0.1:1080'
+    }
+
+    It 'brackets an IPv6 proxy host' {
+        $config = New-GuardConfig -ProxyPort 1080 -ProxyHost '::1' -ExpectedIp '203.0.113.10'
+        Get-ProxyUrl -Config $config | Should -Be 'http://[::1]:1080'
+    }
+
+    It 'uses socks5h so that curl resolves DNS remotely' {
+        $config = New-GuardConfig -ProxyType socks5 -ProxyPort 1080 -ExpectedIp '203.0.113.10'
+        Get-ProxyUrl -Config $config -SocksRemoteDns | Should -Be 'socks5h://127.0.0.1:1080'
+    }
+
+    It 'keeps the http scheme when remote DNS is requested' {
+        $config = New-GuardConfig -ProxyPort 1080 -ExpectedIp '203.0.113.10'
+        Get-ProxyUrl -Config $config -SocksRemoteDns | Should -Be 'http://127.0.0.1:1080'
     }
 }
 
@@ -184,6 +210,38 @@ Describe 'Get-ClaudeProcessViolations' {
         )
         @(Get-ClaudeProcessViolations -Processes $processes -Config $script:config).Count | Should -BeGreaterThan 0
     }
+
+    It 'flags duplicate proxy server arguments' {
+        $processes = @(
+            [pscustomobject]@{ Name = 'Claude.exe'; ProcessId = 10; CommandLine = '"C:\Apps\Claude.exe" --proxy-server=http://127.0.0.1:1080 --proxy-server=http://127.0.0.1:9999' }
+        )
+        $violations = @(Get-ClaudeProcessViolations -Processes $processes -Config $script:config)
+        $violations.Count | Should -BeGreaterThan 0
+        ($violations -join ' ') | Should -Match 'multiple --proxy-server'
+    }
+
+    It 'flags a proxy bypass list' {
+        $processes = @(
+            [pscustomobject]@{ Name = 'Claude.exe'; ProcessId = 10; CommandLine = '"C:\Apps\Claude.exe" --proxy-server=http://127.0.0.1:1080 --proxy-bypass-list=*' }
+        )
+        $violations = @(Get-ClaudeProcessViolations -Processes $processes -Config $script:config)
+        $violations.Count | Should -BeGreaterThan 0
+        ($violations -join ' ') | Should -Match 'proxy bypass argument'
+    }
+
+    It 'flags a no-proxy-server argument' {
+        $processes = @(
+            [pscustomobject]@{ Name = 'Claude.exe'; ProcessId = 10; CommandLine = '"C:\Apps\Claude.exe" --proxy-server=http://127.0.0.1:1080 --no-proxy-server' }
+        )
+        @(Get-ClaudeProcessViolations -Processes $processes -Config $script:config).Count | Should -BeGreaterThan 0
+    }
+
+    It 'can ignore helper-only processes during shutdown' {
+        $processes = @(
+            [pscustomobject]@{ Name = 'Claude.exe'; ProcessId = 11; CommandLine = '"C:\Apps\Claude.exe" --type=utility' }
+        )
+        @(Get-ClaudeProcessViolations -Processes $processes -Config $script:config -IgnoreOrphanHelpers).Count | Should -Be 0
+    }
 }
 
 Describe 'Get-PublicConnections' {
@@ -206,6 +264,18 @@ Describe 'Test-TcpPort' {
         try {
             $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
             Test-TcpPort -Port $port -TimeoutMilliseconds 1000 | Should -BeTrue
+        } finally {
+            $listener.Stop()
+        }
+    }
+
+    It 'can reach an IPv6-only loopback listener' {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Loopback, 0)
+        $listener.Start()
+        try {
+            $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+            Test-TcpPort -TargetHost '::1' -Port $port -TimeoutMilliseconds 1000 | Should -BeTrue
+            Test-TcpPort -Port $port -TimeoutMilliseconds 500 | Should -BeFalse
         } finally {
             $listener.Stop()
         }
@@ -314,6 +384,8 @@ Describe 'Invoke-TraceRequest and Get-CurrentExitIp' {
         New-Item -ItemType Directory -Path $script:temp -Force | Out-Null
         $script:fakeCurl = Join-Path $script:temp 'fake-curl.cmd'
         Set-Content -LiteralPath $script:fakeCurl -Value '@echo off', 'echo ip=203.0.113.10', 'echo loc=JP'
+        $script:fakeCurlArgs = Join-Path $script:temp 'fake-curl-args.cmd'
+        Set-Content -LiteralPath $script:fakeCurlArgs -Value '@echo off', 'echo args=%*', 'echo ip=203.0.113.10'
         $script:config = New-GuardConfig -ProxyPort 1080 -ExpectedIp '203.0.113.10'
     }
 
@@ -328,6 +400,12 @@ Describe 'Invoke-TraceRequest and Get-CurrentExitIp' {
 
     It 'returns the exit IP from the trace' {
         Get-CurrentExitIp -Config $script:config -CurlPath $script:fakeCurl | Should -Be '203.0.113.10'
+    }
+
+    It 'uses socks5h so that curl resolves DNS remotely' {
+        $socksConfig = New-GuardConfig -ProxyType socks5 -ProxyPort 1080 -ExpectedIp '203.0.113.10'
+        $trace = Invoke-TraceRequest -Config $socksConfig -CurlPath $script:fakeCurlArgs
+        $trace | Should -Match 'socks5h://127\.0\.0\.1:1080'
     }
 
     It 'throws when the trace command fails' {
@@ -357,9 +435,51 @@ Describe 'Write-GuardLog' {
         Write-GuardLog -Message 'first entry' -LogPath $script:log -MaxBytes 1
         Write-GuardLog -Message 'second entry' -LogPath $script:log -MaxBytes 1
         Test-Path -LiteralPath ($script:log + '.1') | Should -BeTrue
+        Test-Path -LiteralPath ($script:log + '.2') | Should -BeFalse
         (Get-Content -LiteralPath $script:log -Raw) | Should -Match 'second entry'
     }
 }
+Describe 'Write-GuardLogSafe' {
+    BeforeEach {
+        $script:temp = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-ip-guard-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:temp -Force | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item -LiteralPath $script:temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'does not throw when the log cannot be written' {
+        $blocker = Join-Path $script:temp 'not-a-directory'
+        Set-Content -LiteralPath $blocker -Value 'file'
+        { Write-GuardLogSafe -Message 'failure path' -LogPath (Join-Path $blocker 'guard.log') } | Should -Not -Throw
+    }
+}
+
+Describe 'Test-TextContainsDirectory' {
+    It 'matches a path literally even with wildcard characters' {
+        Test-TextContainsDirectory -Text 'powershell.exe -File "C:\Tools\ClaudeIPGuard[beta]\src\guard.ps1"' -Directory 'C:\Tools\ClaudeIPGuard[beta]' | Should -BeTrue
+    }
+
+    It 'does not match a sibling directory with a longer name' {
+        Test-TextContainsDirectory -Text 'powershell.exe -File "C:\Tools\ClaudeIPGuard2\src\guard.ps1"' -Directory 'C:\Tools\ClaudeIPGuard' | Should -BeFalse
+    }
+}
+
+Describe 'Get-GuardMonitorProcesses' {
+    It 'returns only PowerShell processes that run guard.ps1' {
+        $processes = @(
+            [pscustomobject]@{ Name = 'powershell.exe'; ProcessId = 101; CommandLine = 'powershell.exe -NoProfile -File "C:\Tools\ClaudeIPGuard[beta]\src\guard.ps1"' }
+            [pscustomobject]@{ Name = 'powershell.exe'; ProcessId = 102; CommandLine = 'powershell.exe -File "C:\Tools\ClaudeIPGuard\src\status.ps1"' }
+            [pscustomobject]@{ Name = 'powershell.exe'; ProcessId = 103; CommandLine = 'powershell.exe -NoProfile -Command "Get-Date"' }
+        )
+        $monitors = @(Get-GuardMonitorProcesses -Processes $processes)
+        $monitors.Count | Should -Be 1
+        $monitors[0].ProcessId | Should -Be 101
+        $monitors[0].InstallDir | Should -Be 'C:\Tools\ClaudeIPGuard[beta]'
+    }
+}
+
 Describe 'Read-GuardConfig and Write-GuardConfig' {
     BeforeEach {
         $script:temp = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-ip-guard-' + [guid]::NewGuid().ToString('N'))
@@ -377,6 +497,14 @@ Describe 'Read-GuardConfig and Write-GuardConfig' {
         $read = Read-GuardConfig -Path $script:configPath
         $read.proxyPort | Should -Be 1080
         $read.expectedIp | Should -Be '203.0.113.10'
+    }
+
+    It 'normalizes an abbreviated expected IP when read' {
+        $config = New-GuardConfig -ProxyPort 1080 -ExpectedIp '127.1'
+        $config.expectedIp = '127.1'
+        Write-GuardConfig -Config $config -Path $script:configPath
+        $read = Read-GuardConfig -Path $script:configPath
+        $read.expectedIp | Should -Be '127.0.0.1'
     }
 
     It 'creates the parent directory' {
@@ -437,6 +565,12 @@ Describe 'Get-GuardDecision' {
         $decision.Stop | Should -BeTrue
     }
 
+    It 'does not stop on orphan helpers when told to ignore them' {
+        $helpers = @([pscustomobject]@{ Name = 'Claude.exe'; ProcessId = 11; CommandLine = '"C:\Apps\Claude.exe" --type=utility' })
+        $decision = Get-GuardDecision -Config $script:config -ProxyReachable $true -ExitIp '203.0.113.10' -Processes $helpers -Connections @() -IgnoreOrphanHelpers
+        $decision.Stop | Should -BeFalse
+    }
+
     It 'stops on a public TCP connection' {
         $connections = @([pscustomobject]@{ RemoteAddress = '198.51.100.20'; RemotePort = 443; State = 'Established' })
         $decision = Get-GuardDecision -Config $script:config -ProxyReachable $true -ExitIp '203.0.113.10' -Processes $script:guarded -Connections $connections -ConnectionQuerySucceeded $true
@@ -462,5 +596,20 @@ Describe 'New-InstallPlan' {
     It 'omits shortcuts when NoShortcuts is set' {
         $plan = New-InstallPlan -InstallDir 'C:\Users\Example\AppData\Local\ClaudeIPGuard' -SourceRoot 'C:\Repo' -ClaudeExe '' -NoShortcuts
         @($plan.Shortcuts).Count | Should -Be 0
+    }
+}
+
+Describe 'guard.ps1 fail-closed invariants' {
+    BeforeAll {
+        $script:GuardText = Get-Content -LiteralPath $script:GuardScriptPath -Raw
+    }
+
+    It 'treats an abandoned mutex as acquired so a killed monitor cannot fail open' {
+        $script:GuardText | Should -Match 'AbandonedMutexException'
+    }
+
+    It 'only clears the consecutive check-error counter after a fully successful iteration' {
+        $script:GuardText | Should -Match '\$checkFailed = \$true'
+        $script:GuardText | Should -Match 'if \(-not \$checkFailed\)'
     }
 }
